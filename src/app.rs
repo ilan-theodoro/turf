@@ -9,13 +9,13 @@ use std::{process::Stdio, time::Duration};
 use crate::file_watcher::{FileWatcherError, FileWatcherHandle};
 use crate::job_watcher::JobWatcherHandle;
 
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, MouseEvent, MouseEventKind, MouseButton};
 use ratatui::{
     backend::Backend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame, Terminal,
 };
 use std::io;
@@ -46,6 +46,10 @@ pub struct App {
     dialog: Option<Dialog>,
     jobs: Vec<Job>,
     job_list_state: ListState,
+    job_list_scrollbar_state: ScrollbarState,
+    job_list_scrollbar_area: Rect,
+    job_list_area: Rect,
+    job_output_area: Rect,
     job_output: Result<String, FileWatcherError>,
     job_output_anchor: ScrollAnchor,
     job_output_offset: u16,
@@ -56,6 +60,7 @@ pub struct App {
     receiver: Receiver<AppMessage>,
     input_receiver: Receiver<std::io::Result<Event>>,
     output_file_view: OutputFileView,
+    is_dragging_scrollbar: bool,
 }
 
 pub struct Job {
@@ -113,6 +118,10 @@ impl App {
                 s.select(Some(0));
                 s
             },
+            job_list_scrollbar_state: ScrollbarState::default(),
+            job_list_scrollbar_area: Rect::default(),
+            job_list_area: Rect::default(),
+            job_output_area: Rect::default(),
             job_output: Ok("".to_string()),
             job_output_anchor: ScrollAnchor::Bottom,
             job_output_offset: 0,
@@ -125,6 +134,7 @@ impl App {
             receiver: receiver,
             input_receiver: input_receiver,
             output_file_view: OutputFileView::default(),
+            is_dragging_scrollbar: false,
         }
     }
 }
@@ -132,11 +142,22 @@ impl App {
 impl App {
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> io::Result<()> {
         terminal.draw(|f| self.ui(f))?;
+        let mut needs_redraw = false;
+        let mut is_scrolling = false;
+        const SCROLL_TIMEOUT_MS: u64 = 16; // ~60fps for smooth scrolling
 
         loop {
+            let timeout = if is_scrolling {
+                Duration::from_millis(SCROLL_TIMEOUT_MS)
+            } else {
+                Duration::from_secs(3600) // Long timeout when not scrolling
+            };
+
             select! {
                 recv(self.receiver) -> event => {
                     self.handle(event.unwrap());
+                    needs_redraw = true;
+                    is_scrolling = false;
                 }
                 recv(self.input_receiver) -> input_res => {
                     match input_res.unwrap().unwrap() {
@@ -145,20 +166,53 @@ impl App {
                                 return Ok(());
                             }
                             self.handle(AppMessage::Key(key));
+                            needs_redraw = true;
+                            is_scrolling = false;
                         },
-                        Event::Resize(_, _) => {},
-                        _ => continue, // ignore and do not redraw
+                        Event::Mouse(mouse) => {
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                                    self.handle_mouse(mouse);
+                                    needs_redraw = true;
+                                    is_scrolling = true;
+                                },
+                                _ => {
+                                    self.handle_mouse(mouse);
+                                    needs_redraw = true;
+                                    is_scrolling = false;
+                                }
+                            }
+                        },
+                        Event::Resize(_, _) => {
+                            needs_redraw = true;
+                            is_scrolling = false;
+                        },
+                        _ => {
+                            is_scrolling = false;
+                            continue; // ignore and do not redraw
+                        }
                     }
+                }
+                default(timeout) => {
+                    // Timeout reached - stop scrolling mode
+                    is_scrolling = false;
                 }
             };
 
-            terminal.draw(|f| self.ui(f))?;
+            // Redraw if needed
+            if needs_redraw {
+                terminal.draw(|f| self.ui(f))?;
+                needs_redraw = false;
+            }
         }
     }
 
     fn handle(&mut self, msg: AppMessage) {
         match msg {
-            AppMessage::Jobs(jobs) => self.jobs = jobs,
+            AppMessage::Jobs(jobs) => {
+                self.jobs = jobs;
+                self.update_job_list_scrollbar();
+            },
             AppMessage::JobOutput(content) => self.job_output = content,
             AppMessage::Key(key) => {
                 if let Some(dialog) = &self.dialog {
@@ -286,6 +340,12 @@ impl App {
             .constraints([Constraint::Min(50), Constraint::Percentage(70)].as_ref())
             .split(content_help[0]);
 
+        // Split the job list area to make room for scrollbar
+        let job_area_with_scrollbar = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(1), Constraint::Min(0)].as_ref())
+            .split(master_detail[0]);
+
         let job_detail_log = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(7), Constraint::Min(3)].as_ref())
@@ -390,7 +450,18 @@ impl App {
                     }),
             )
             .highlight_style(Style::default().bg(Color::Green).fg(Color::Black));
-        f.render_stateful_widget(job_list, master_detail[0], &mut self.job_list_state);
+        f.render_stateful_widget(job_list, job_area_with_scrollbar[1], &mut self.job_list_state);
+
+        // Store areas for mouse interaction
+        self.job_list_scrollbar_area = job_area_with_scrollbar[0];
+        self.job_list_area = job_area_with_scrollbar[1];
+        
+        // Render the scrollbar
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalLeft)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"));
+        f.render_stateful_widget(scrollbar, job_area_with_scrollbar[0], &mut self.job_list_scrollbar_state);
 
         // Job details
 
@@ -499,6 +570,8 @@ impl App {
         }
         .block(log_block);
 
+        // Store log area for mouse interaction
+        self.job_output_area = log_area;
         f.render_widget(log, log_area);
 
         if let Some(dialog) = &self.dialog {
@@ -681,6 +754,92 @@ fn fit_text(
 }
 
 impl App {
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self.is_mouse_in_job_list(mouse.column, mouse.row) {
+                    self.select_previous_job();
+                } else if self.is_mouse_in_job_output(mouse.column, mouse.row) {
+                    self.scroll_job_output_up();
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if self.is_mouse_in_job_list(mouse.column, mouse.row) {
+                    self.select_next_job();
+                } else if self.is_mouse_in_job_output(mouse.column, mouse.row) {
+                    self.scroll_job_output_down();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Handle scrollbar clicks and start drag
+                if self.is_mouse_in_scrollbar(mouse.column, mouse.row) {
+                    self.is_dragging_scrollbar = true;
+                    self.handle_scrollbar_click(mouse.row);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // End drag
+                self.is_dragging_scrollbar = false;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                // Handle dragging
+                if self.is_dragging_scrollbar {
+                    self.handle_scrollbar_drag(mouse.row);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn is_mouse_in_scrollbar(&self, column: u16, row: u16) -> bool {
+        let area = &self.job_list_scrollbar_area;
+        column >= area.x && column < area.x + area.width &&
+        row >= area.y && row < area.y + area.height
+    }
+
+    fn is_mouse_in_job_list(&self, column: u16, row: u16) -> bool {
+        let area = &self.job_list_area;
+        column >= area.x && column < area.x + area.width &&
+        row >= area.y && row < area.y + area.height
+    }
+
+    fn is_mouse_in_job_output(&self, column: u16, row: u16) -> bool {
+        let area = &self.job_output_area;
+        column >= area.x && column < area.x + area.width &&
+        row >= area.y && row < area.y + area.height
+    }
+
+    fn handle_scrollbar_click(&mut self, row: u16) {
+        self.handle_scrollbar_position_change(row);
+    }
+
+    fn handle_scrollbar_drag(&mut self, row: u16) {
+        self.handle_scrollbar_position_change(row);
+    }
+
+    fn handle_scrollbar_position_change(&mut self, row: u16) {
+        let scrollbar_area = &self.job_list_scrollbar_area;
+        if self.jobs.is_empty() {
+            return;
+        }
+        
+        // Calculate relative position within scrollbar (0.0 to 1.0)
+        let relative_y = if row >= scrollbar_area.y && row < scrollbar_area.y + scrollbar_area.height {
+            (row - scrollbar_area.y) as f32 / scrollbar_area.height.saturating_sub(1) as f32
+        } else if row < scrollbar_area.y {
+            0.0 // Above scrollbar = top
+        } else {
+            1.0 // Below scrollbar = bottom
+        };
+        
+        // Map to job index
+        let target_index = (relative_y * (self.jobs.len() - 1) as f32).round() as usize;
+        let target_index = target_index.min(self.jobs.len() - 1);
+        
+        self.job_list_state.select(Some(target_index));
+        self.update_job_list_scrollbar();
+    }
+
     fn focus_next_panel(&mut self) {
         match self.focus {
             Focus::Jobs => self.focus = Focus::Jobs,
@@ -694,10 +853,14 @@ impl App {
     }
 
     fn select_next_job(&mut self) {
+        if self.jobs.is_empty() {
+            return;
+        }
+        
         let i = match self.job_list_state.selected() {
             Some(i) => {
                 if i >= self.jobs.len() - 1 {
-                    self.jobs.len() - 1
+                    i // Stay at the last item, no wrapping
                 } else {
                     i + 1
                 }
@@ -705,13 +868,18 @@ impl App {
             None => 0,
         };
         self.job_list_state.select(Some(i));
+        self.update_job_list_scrollbar();
     }
 
     fn select_previous_job(&mut self) {
+        if self.jobs.is_empty() {
+            return;
+        }
+        
         let i = match self.job_list_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    0
+                    0 // Stay at the first item, no wrapping
                 } else {
                     i - 1
                 }
@@ -719,5 +887,36 @@ impl App {
             None => 0,
         };
         self.job_list_state.select(Some(i));
+        self.update_job_list_scrollbar();
+    }
+
+    fn update_job_list_scrollbar(&mut self) {
+        self.job_list_scrollbar_state = self.job_list_scrollbar_state
+            .content_length(self.jobs.len())
+            .position(self.job_list_state.selected().unwrap_or(0));
+    }
+
+    fn scroll_job_output_up(&mut self) {
+        let delta = 3; // Scroll 3 lines at a time
+        match self.job_output_anchor {
+            ScrollAnchor::Top => {
+                self.job_output_offset = self.job_output_offset.saturating_sub(delta);
+            }
+            ScrollAnchor::Bottom => {
+                self.job_output_offset = self.job_output_offset.saturating_add(delta);
+            }
+        }
+    }
+
+    fn scroll_job_output_down(&mut self) {
+        let delta = 3; // Scroll 3 lines at a time
+        match self.job_output_anchor {
+            ScrollAnchor::Top => {
+                self.job_output_offset = self.job_output_offset.saturating_add(delta);
+            }
+            ScrollAnchor::Bottom => {
+                self.job_output_offset = self.job_output_offset.saturating_sub(delta);
+            }
+        }
     }
 }

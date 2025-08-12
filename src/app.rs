@@ -31,7 +31,7 @@ pub enum ViewMode {
 }
 
 pub enum Dialog {
-    ConfirmCancelJob(String),
+    ConfirmCancelJob(String, bool), // (job_id, is_array_job)
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +70,10 @@ pub struct App {
     input_receiver: Receiver<std::io::Result<Event>>,
     output_file_view: OutputFileView,
     is_dragging_scrollbar: bool,
+    split_ratio: u16, // Percentage for left panel (job list)
+    is_dragging_resize: bool,
+    resize_area: Rect,
+    terminal_width: u16,
 }
 
 pub struct Job {
@@ -127,6 +131,16 @@ impl DisplayJob {
             self.job_id.clone()
         }
     }
+
+    fn cancel_id(&self) -> String {
+        if self.is_array {
+            // For collapsed array jobs, return the array_id for canceling the entire array
+            self.array_id.clone()
+        } else {
+            // For individual jobs, return the job_id
+            self.job_id.clone()
+        }
+    }
 }
 
 pub enum AppMessage {
@@ -177,6 +191,10 @@ impl App {
             input_receiver: input_receiver,
             output_file_view: OutputFileView::default(),
             is_dragging_scrollbar: false,
+            split_ratio: 30, // Default 30% for job list, 70% for details
+            is_dragging_resize: false,
+            resize_area: Rect::default(),
+            terminal_width: 100,
         }
     }
 }
@@ -260,7 +278,7 @@ impl App {
             AppMessage::Key(key) => {
                 if let Some(dialog) = &self.dialog {
                     match dialog {
-                        Dialog::ConfirmCancelJob(id) => match key.code {
+                        Dialog::ConfirmCancelJob(id, _) => match key.code {
                             KeyCode::Enter | KeyCode::Char('y') => {
                                 Command::new("scancel")
                                     .arg(id)
@@ -337,12 +355,11 @@ impl App {
                             self.job_output_anchor = ScrollAnchor::Bottom;
                         }
                         KeyCode::Char('c') => {
-                            if let Some(id) = self
-                                .job_list_state
-                                .selected()
-                                .and_then(|i| self.display_jobs.get(i).map(|j| j.id()))
-                            {
-                                self.dialog = Some(Dialog::ConfirmCancelJob(id));
+                            if let Some(selected_idx) = self.job_list_state.selected() {
+                                if let Some(display_job) = self.display_jobs.get(selected_idx) {
+                                    let cancel_id = display_job.cancel_id();
+                                    self.dialog = Some(Dialog::ConfirmCancelJob(cancel_id, display_job.is_array));
+                                }
                             }
                         }
                         KeyCode::Char('o') => {
@@ -379,6 +396,9 @@ impl App {
     }
 
     fn ui(&mut self, f: &mut Frame) {
+        // Store terminal width for resize calculations
+        self.terminal_width = f.area().width;
+        
         // Layout
 
         let content_help = Layout::default()
@@ -388,7 +408,7 @@ impl App {
 
         let master_detail = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(50), Constraint::Percentage(70)].as_ref())
+            .constraints([Constraint::Percentage(self.split_ratio), Constraint::Percentage(100 - self.split_ratio)].as_ref())
             .split(content_help[0]);
 
         // Split the job list area to make room for scrollbar
@@ -502,6 +522,23 @@ impl App {
         // Store areas for mouse interaction
         self.job_list_scrollbar_area = job_area_with_scrollbar[0];
         self.job_list_area = job_area_with_scrollbar[1];
+        
+        // Create resize area (2 pixels wide at the border between panels)
+        self.resize_area = Rect::new(
+            master_detail[0].right().saturating_sub(1),
+            master_detail[0].y,
+            2,
+            master_detail[0].height,
+        );
+        
+        // Render resize handle (thin vertical line)
+        let resize_handle = Block::default();
+        f.render_widget(resize_handle, Rect::new(
+            master_detail[0].right().saturating_sub(1),
+            master_detail[0].y,
+            1,
+            master_detail[0].height,
+        ));
         
         // Render the scrollbar
         let scrollbar = Scrollbar::default()
@@ -640,20 +677,30 @@ impl App {
             }
 
             match dialog {
-                Dialog::ConfirmCancelJob(id) => {
-                    let dialog = Paragraph::new(Line::from(vec![
-                        Span::raw("Cancel job "),
-                        Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw("?"),
-                    ]))
-                    .style(Style::default().fg(Color::White))
-                    .wrap(Wrap { trim: true })
-                    .block(
-                        Block::default()
-                            .title("Confirm")
-                            .borders(Borders::ALL)
-                            .style(Style::default().fg(Color::Green)),
-                    );
+                Dialog::ConfirmCancelJob(id, is_array) => {
+                    let message = if *is_array {
+                        Line::from(vec![
+                            Span::raw("Cancel entire array job "),
+                            Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
+                            Span::raw(" (all tasks)?"),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::raw("Cancel job "),
+                            Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
+                            Span::raw("?"),
+                        ])
+                    };
+
+                    let dialog = Paragraph::new(message)
+                        .style(Style::default().fg(Color::White))
+                        .wrap(Wrap { trim: true })
+                        .block(
+                            Block::default()
+                                .title("Confirm")
+                                .borders(Borders::ALL)
+                                .style(Style::default().fg(Color::Green)),
+                        );
 
                     let area = centered_lines(75, 3, f.area());
                     f.render_widget(Clear, area);
@@ -822,16 +869,21 @@ impl App {
                 if self.is_mouse_in_scrollbar(mouse.column, mouse.row) {
                     self.is_dragging_scrollbar = true;
                     self.handle_scrollbar_click(mouse.row);
+                } else if self.is_mouse_in_resize_area(mouse.column, mouse.row) {
+                    self.is_dragging_resize = true;
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 // End drag
                 self.is_dragging_scrollbar = false;
+                self.is_dragging_resize = false;
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 // Handle dragging
                 if self.is_dragging_scrollbar {
                     self.handle_scrollbar_drag(mouse.row);
+                } else if self.is_dragging_resize {
+                    self.handle_resize_drag(mouse.column);
                 }
             }
             _ => {}
@@ -856,12 +908,28 @@ impl App {
         row >= area.y && row < area.y + area.height
     }
 
+    fn is_mouse_in_resize_area(&self, column: u16, row: u16) -> bool {
+        let area = &self.resize_area;
+        column >= area.x && column < area.x + area.width &&
+        row >= area.y && row < area.y + area.height
+    }
+
     fn handle_scrollbar_click(&mut self, row: u16) {
         self.handle_scrollbar_position_change(row);
     }
 
     fn handle_scrollbar_drag(&mut self, row: u16) {
         self.handle_scrollbar_position_change(row);
+    }
+
+    fn handle_resize_drag(&mut self, column: u16) {
+        // Calculate new split ratio based on mouse position
+        // Ensure minimum sizes for both panels
+        let min_left = 20; // Minimum 20% for left panel
+        let max_left = 80; // Maximum 80% for left panel
+        
+        let new_ratio = ((column as f32 / self.terminal_width as f32) * 100.0) as u16;
+        self.split_ratio = new_ratio.max(min_left).min(max_left);
     }
 
     fn handle_scrollbar_position_change(&mut self, row: u16) {

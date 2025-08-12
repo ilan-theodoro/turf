@@ -827,6 +827,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "slog"
+version = "0.8.0"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "crossbeam",
+ "crossterm 0.29.0",
+ "fuzzy-matcher",
+ "itertools 0.14.0",
+ "lazy_static",
+ "notify",
+ "ratatui",
+ "regex",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -884,22 +900,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "turm"
-version = "0.7.3"
-dependencies = [
- "clap",
- "clap_complete",
- "crossbeam",
- "crossterm 0.29.0",
- "fuzzy-matcher",
- "itertools 0.14.0",
- "lazy_static",
- "notify",
- "ratatui",
- "regex",
 ]
 
 [[package]]

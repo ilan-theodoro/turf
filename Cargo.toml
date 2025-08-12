@@ -1,9 +1,9 @@
 [package]
-name = "slog"
+name = "turf"
 version = "0.8.0"
 authors = ["Ilan Silva"]
-description = "slog - squeue logger. A TUI for the Slurm Workload Manager."
-repository = "https://github.com/ilan-theodoro/slog"
+description = "turf - turm but friendlier. A TUI for the Slurm Workload Manager."
+repository = "https://github.com/ilan-theodoro/turf"
 license = "MIT"
 edition = "2021"
 

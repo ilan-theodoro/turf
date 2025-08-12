@@ -29,7 +29,7 @@ impl JobWatcher {
     }
 
     fn run(&mut self) -> Self {
-        let output_separator = "###slog###";
+        let output_separator = "###turf###";
         let fields = [
             "jobid",
             "name",

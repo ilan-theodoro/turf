@@ -2,7 +2,7 @@
 
 ## Fork Notice
 
-This is a fork of [turm](https://github.com/kabouzeid/turm) renamed to **slog** (*squeue logger*).
+This is a fork of [turm](https://github.com/kabouzeid/turm) renamed to **turf** (*turm but friendlier*).
 
 Maintained by **Ilan Theodoro**.
 

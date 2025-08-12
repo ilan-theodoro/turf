@@ -1,9 +1,9 @@
 [package]
-name = "turm"
-version = "0.7.3"
-authors = ["Karim Abou Zeid <contact@ka.codes>"]
-description = "A TUI for the Slurm Workload Manager."
-repository = "https://github.com/kabouzeid/turm"
+name = "slog"
+version = "0.8.0"
+authors = ["Ilan Silva"]
+description = "slog - squeue logger. A TUI for the Slurm Workload Manager."
+repository = "https://github.com/ilan-theodoro/slog"
 license = "MIT"
 edition = "2021"
 

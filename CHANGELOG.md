@@ -1,5 +1,13 @@
 # Changelog
 
+## Fork Notice
+
+This is a fork of [turm](https://github.com/kabouzeid/turm) renamed to **slog** (*squeue logger*).
+
+Maintained by **Ilan Theodoro**.
+
+---
+
 ## [0.7.3](https://github.com/kabouzeid/turm/compare/v0.7.2...v0.7.3) (2024-07-28)
 
 

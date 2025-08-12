@@ -15,13 +15,19 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap},
     Frame, Terminal,
 };
 use std::io;
 
 pub enum Focus {
     Jobs,
+}
+
+#[derive(Clone)]
+pub enum ViewMode {
+    AllJobs,
+    ArrayJobDetails(String), // array_id
 }
 
 pub enum Dialog {
@@ -44,8 +50,11 @@ pub enum OutputFileView {
 pub struct App {
     focus: Focus,
     dialog: Option<Dialog>,
+    view_mode: ViewMode,
     jobs: Vec<Job>,
-    job_list_state: ListState,
+    display_jobs: Vec<DisplayJob>,
+    original_squeue_args: Vec<String>,
+    job_list_state: TableState,
     job_list_scrollbar_state: ScrollbarState,
     job_list_scrollbar_area: Rect,
     job_list_area: Rect,
@@ -54,7 +63,7 @@ pub struct App {
     job_output_anchor: ScrollAnchor,
     job_output_offset: u16,
     job_output_wrap: bool,
-    _job_watcher: JobWatcherHandle,
+    job_watcher: JobWatcherHandle,
     job_output_watcher: FileWatcherHandle,
     // sender: Sender<AppMessage>,
     receiver: Receiver<AppMessage>,
@@ -81,11 +90,41 @@ pub struct Job {
     pub command: String,
 }
 
+#[derive(Clone)]
+pub struct DisplayJob {
+    pub job_id: String,
+    pub array_id: String,
+    pub name: String,
+    pub state: String,
+    pub state_compact: String,
+    pub reason: Option<String>,
+    pub user: String,
+    pub time: String,
+    pub tres: String,
+    pub partition: String,
+    pub nodelist: String,
+    pub command: String,
+    pub is_array: bool,
+    pub task_count: Option<usize>,
+    pub stdout: Option<PathBuf>,
+    pub stderr: Option<PathBuf>,
+}
+
 impl Job {
     fn id(&self) -> String {
         match self.array_step.as_ref() {
             Some(array_step) => format!("{}_{}", self.array_id, array_step),
             None => self.job_id.clone(),
+        }
+    }
+}
+
+impl DisplayJob {
+    fn id(&self) -> String {
+        if self.is_array {
+            format!("{}_[1-{}]", self.array_id, self.task_count.unwrap_or(0))
+        } else {
+            self.job_id.clone()
         }
     }
 }
@@ -107,14 +146,17 @@ impl App {
         Self {
             focus: Focus::Jobs,
             dialog: None,
+            view_mode: ViewMode::AllJobs,
             jobs: Vec::new(),
-            _job_watcher: JobWatcherHandle::new(
+            display_jobs: Vec::new(),
+            original_squeue_args: squeue_args.clone(),
+            job_watcher: JobWatcherHandle::new(
                 sender.clone(),
                 Duration::from_secs(slurm_refresh_rate),
                 squeue_args,
             ),
             job_list_state: {
-                let mut s = ListState::default();
+                let mut s = TableState::default();
                 s.select(Some(0));
                 s
             },
@@ -211,6 +253,7 @@ impl App {
         match msg {
             AppMessage::Jobs(jobs) => {
                 self.jobs = jobs;
+                self.update_display_jobs();
                 self.update_job_list_scrollbar();
             },
             AppMessage::JobOutput(content) => self.job_output = content,
@@ -297,7 +340,7 @@ impl App {
                             if let Some(id) = self
                                 .job_list_state
                                 .selected()
-                                .and_then(|i| self.jobs.get(i).map(|j| j.id()))
+                                .and_then(|i| self.display_jobs.get(i).map(|j| j.id()))
                             {
                                 self.dialog = Some(Dialog::ConfirmCancelJob(id));
                             }
@@ -311,6 +354,14 @@ impl App {
                         KeyCode::Char('w') => {
                             self.job_output_wrap = !self.job_output_wrap;
                         }
+                        KeyCode::Enter => {
+                            self.enter_array_job();
+                        }
+                        KeyCode::Esc => {
+                            if matches!(self.view_mode, ViewMode::ArrayJobDetails(_)) {
+                                self.exit_array_job();
+                            }
+                        }
                         _ => {}
                     };
                 }
@@ -320,7 +371,7 @@ impl App {
         // update
         self.job_output_watcher
             .set_file_path(self.job_list_state.selected().and_then(|i| {
-                self.jobs.get(i).and_then(|j| match self.output_file_view {
+                self.display_jobs.get(i).and_then(|j| match self.output_file_view {
                     OutputFileView::Stdout => j.stdout.clone(),
                     OutputFileView::Stderr => j.stderr.clone(),
                 })
@@ -352,17 +403,24 @@ impl App {
             .split(master_detail[1]);
 
         // Help
-        let help_options = vec![
-            ("q", "quit"),
-            ("⏶/⏷", "navigate"),
-            ("pgup/pgdown", "scroll"),
-            ("home/end", "top/bottom"),
-            ("esc", "cancel"),
-            ("enter", "confirm"),
-            ("c", "cancel job"),
-            ("o", "toggle stdout/stderr"),
-            ("w", "toggle text wrap"),
-        ];
+        let help_options = match &self.view_mode {
+            ViewMode::AllJobs => vec![
+                ("q", "quit"),
+                ("⏶/⏷", "navigate"),
+                ("enter", "expand array"),
+                ("c", "cancel job"),
+                ("o", "toggle stdout/stderr"),
+                ("w", "toggle text wrap"),
+            ],
+            ViewMode::ArrayJobDetails(_) => vec![
+                ("q", "quit"),
+                ("⏶/⏷", "navigate"),
+                ("esc", "back to jobs"),
+                ("c", "cancel job"),
+                ("o", "toggle stdout/stderr"),
+                ("w", "toggle text wrap"),
+            ],
+        };
         let blue_style = Style::default().fg(Color::Blue);
         let light_blue_style = Style::default().fg(Color::LightBlue);
 
@@ -383,63 +441,51 @@ impl App {
         f.render_widget(help, content_help[1]);
 
         // Jobs
-        let max_id_len = self.jobs.iter().map(|j| j.id().len()).max().unwrap_or(0);
-        let max_user_len = self.jobs.iter().map(|j| j.user.len()).max().unwrap_or(0);
-        let max_partition_len = self
-            .jobs
-            .iter()
-            .map(|j| j.partition.len())
-            .max()
-            .unwrap_or(0);
-        let max_time_len = self.jobs.iter().map(|j| j.time.len()).max().unwrap_or(0);
-        let max_state_compact_len = self
-            .jobs
-            .iter()
-            .map(|j| j.state_compact.len())
-            .max()
-            .unwrap_or(0);
-        let jobs: Vec<ListItem> = self
-            .jobs
+        let rows: Vec<Row> = self
+            .display_jobs
             .iter()
             .map(|j| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "{:<max$.max$}",
-                            j.state_compact,
-                            max = max_state_compact_len
-                        ),
-                        Style::default(),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:<max$.max$}", j.id(), max = max_id_len),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:<max$.max$}", j.partition, max = max_partition_len),
-                        Style::default().fg(Color::Blue),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:<max$.max$}", j.user, max = max_user_len),
-                        Style::default().fg(Color::Green),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:>max$.max$}", j.time, max = max_time_len),
-                        Style::default().fg(Color::Red),
-                    ),
-                    Span::raw(" "),
-                    Span::raw(&j.name),
-                ]))
+                let id_display = if j.is_array && j.task_count.is_some() {
+                    format!("{} [{}]", j.array_id, j.task_count.unwrap())
+                } else {
+                    j.id()
+                };
+                let row = Row::new(vec![
+                    j.state_compact.clone(),
+                    id_display,
+                    j.partition.clone(),
+                    j.user.clone(),
+                    j.time.clone(),
+                    j.name.clone(),
+                ]);
+                
+                // Apply different style for collapsed array jobs
+                if j.is_array {
+                    row.style(Style::default().fg(Color::Cyan))
+                } else {
+                    row
+                }
             })
             .collect();
-        let job_list = List::new(jobs)
+
+        let title = match &self.view_mode {
+            ViewMode::AllJobs => format!("Jobs ({}) - Cyan = Array Jobs", self.display_jobs.len()),
+            ViewMode::ArrayJobDetails(array_id) => format!("Array Job {} Tasks ({})", array_id, self.display_jobs.len()),
+        };
+
+        let job_table = Table::new(rows, [
+            Constraint::Length(3),  // State compact
+            Constraint::Min(8),     // Job ID
+            Constraint::Min(8),     // Partition
+            Constraint::Min(8),     // User
+            Constraint::Min(8),     // Time
+            Constraint::Min(20),    // Name
+        ])
+            .header(Row::new(vec!["ST", "Job ID", "Partition", "User", "Time", "Name"])
+                .style(Style::default().add_modifier(Modifier::BOLD)))
             .block(
                 Block::default()
-                    .title(format!("Jobs ({})", self.jobs.len()))
+                    .title(title)
                     .borders(Borders::ALL)
                     .border_style(if self.dialog.is_some() {
                         Style::default()
@@ -449,8 +495,9 @@ impl App {
                         }
                     }),
             )
-            .highlight_style(Style::default().bg(Color::Green).fg(Color::Black));
-        f.render_stateful_widget(job_list, job_area_with_scrollbar[1], &mut self.job_list_state);
+            .row_highlight_style(Style::default().bg(Color::Green).fg(Color::Black))
+            .column_spacing(1);
+        f.render_stateful_widget(job_table, job_area_with_scrollbar[1], &mut self.job_list_state);
 
         // Store areas for mouse interaction
         self.job_list_scrollbar_area = job_area_with_scrollbar[0];
@@ -468,7 +515,7 @@ impl App {
         let job_detail = self
             .job_list_state
             .selected()
-            .and_then(|i| self.jobs.get(i));
+            .and_then(|i| self.display_jobs.get(i));
 
         let job_detail = job_detail.map(|j| {
             let state = Line::from(vec![
@@ -819,7 +866,7 @@ impl App {
 
     fn handle_scrollbar_position_change(&mut self, row: u16) {
         let scrollbar_area = &self.job_list_scrollbar_area;
-        if self.jobs.is_empty() {
+        if self.display_jobs.is_empty() {
             return;
         }
         
@@ -833,8 +880,8 @@ impl App {
         };
         
         // Map to job index
-        let target_index = (relative_y * (self.jobs.len() - 1) as f32).round() as usize;
-        let target_index = target_index.min(self.jobs.len() - 1);
+        let target_index = (relative_y * (self.display_jobs.len() - 1) as f32).round() as usize;
+        let target_index = target_index.min(self.display_jobs.len() - 1);
         
         self.job_list_state.select(Some(target_index));
         self.update_job_list_scrollbar();
@@ -853,13 +900,13 @@ impl App {
     }
 
     fn select_next_job(&mut self) {
-        if self.jobs.is_empty() {
+        if self.display_jobs.is_empty() {
             return;
         }
         
         let i = match self.job_list_state.selected() {
             Some(i) => {
-                if i >= self.jobs.len() - 1 {
+                if i >= self.display_jobs.len() - 1 {
                     i // Stay at the last item, no wrapping
                 } else {
                     i + 1
@@ -872,7 +919,7 @@ impl App {
     }
 
     fn select_previous_job(&mut self) {
-        if self.jobs.is_empty() {
+        if self.display_jobs.is_empty() {
             return;
         }
         
@@ -890,9 +937,131 @@ impl App {
         self.update_job_list_scrollbar();
     }
 
+    fn update_display_jobs(&mut self) {
+        self.display_jobs = match &self.view_mode {
+            ViewMode::AllJobs => {
+                use std::collections::HashMap;
+                let mut array_jobs: HashMap<String, Vec<&Job>> = HashMap::new();
+                let mut individual_jobs = Vec::new();
+
+                // Group jobs by array_id
+                for job in &self.jobs {
+                    if job.array_step.is_some() {
+                        array_jobs.entry(job.array_id.clone()).or_insert_with(Vec::new).push(job);
+                    } else {
+                        individual_jobs.push(job);
+                    }
+                }
+
+                let mut display_jobs = Vec::new();
+
+                // Add individual jobs
+                for job in individual_jobs {
+                    display_jobs.push(DisplayJob {
+                        job_id: job.job_id.clone(),
+                        array_id: job.array_id.clone(),
+                        name: job.name.clone(),
+                        state: job.state.clone(),
+                        state_compact: job.state_compact.clone(),
+                        reason: job.reason.clone(),
+                        user: job.user.clone(),
+                        time: job.time.clone(),
+                        tres: job.tres.clone(),
+                        partition: job.partition.clone(),
+                        nodelist: job.nodelist.clone(),
+                        command: job.command.clone(),
+                        is_array: false,
+                        task_count: None,
+                        stdout: job.stdout.clone(),
+                        stderr: job.stderr.clone(),
+                    });
+                }
+
+                // Add collapsed array jobs
+                for (array_id, jobs) in array_jobs {
+                    if let Some(first_job) = jobs.first() {
+                        display_jobs.push(DisplayJob {
+                            job_id: array_id.clone(),
+                            array_id: array_id,
+                            name: first_job.name.clone(),
+                            state: first_job.state.clone(),
+                            state_compact: first_job.state_compact.clone(),
+                            reason: first_job.reason.clone(),
+                            user: first_job.user.clone(),
+                            time: first_job.time.clone(),
+                            tres: first_job.tres.clone(),
+                            partition: first_job.partition.clone(),
+                            nodelist: first_job.nodelist.clone(),
+                            command: first_job.command.clone(),
+                            is_array: true,
+                            task_count: Some(jobs.len()),
+                            stdout: first_job.stdout.clone(),
+                            stderr: first_job.stderr.clone(),
+                        });
+                    }
+                }
+
+                display_jobs
+            },
+            ViewMode::ArrayJobDetails(array_id) => {
+                // Filter jobs to show only tasks from the specific array
+                self.jobs.iter()
+                    .filter(|job| job.array_id == *array_id && job.array_step.is_some())
+                    .map(|job| DisplayJob {
+                        job_id: job.job_id.clone(),
+                        array_id: job.array_id.clone(),
+                        name: job.name.clone(),
+                        state: job.state.clone(),
+                        state_compact: job.state_compact.clone(),
+                        reason: job.reason.clone(),
+                        user: job.user.clone(),
+                        time: job.time.clone(),
+                        tres: job.tres.clone(),
+                        partition: job.partition.clone(),
+                        nodelist: job.nodelist.clone(),
+                        command: job.command.clone(),
+                        is_array: false,
+                        task_count: None,
+                        stdout: job.stdout.clone(),
+                        stderr: job.stderr.clone(),
+                    })
+                    .collect()
+            }
+        };
+    }
+
+    fn enter_array_job(&mut self) {
+        if let Some(selected_idx) = self.job_list_state.selected() {
+            if let Some(display_job) = self.display_jobs.get(selected_idx) {
+                if display_job.is_array {
+                    self.view_mode = ViewMode::ArrayJobDetails(display_job.array_id.clone());
+                    
+                    // Update squeue args to filter by array job
+                    let new_args = vec!["--job".to_string(), display_job.array_id.clone()];
+                    self.job_watcher.update_squeue_args(new_args);
+                    
+                    self.update_display_jobs();
+                    self.job_list_state.select(Some(0));
+                    self.update_job_list_scrollbar();
+                }
+            }
+        }
+    }
+
+    fn exit_array_job(&mut self) {
+        self.view_mode = ViewMode::AllJobs;
+        
+        // Reset squeue args to original args
+        self.job_watcher.update_squeue_args(self.original_squeue_args.clone());
+        
+        self.update_display_jobs();
+        self.job_list_state.select(Some(0));
+        self.update_job_list_scrollbar();
+    }
+
     fn update_job_list_scrollbar(&mut self) {
         self.job_list_scrollbar_state = self.job_list_scrollbar_state
-            .content_length(self.jobs.len())
+            .content_length(self.display_jobs.len())
             .position(self.job_list_state.selected().unwrap_or(0));
     }
 

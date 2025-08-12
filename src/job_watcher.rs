@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::{io::BufRead, process::Command, thread, time::Duration};
 
-use crossbeam::channel::Sender;
+use crossbeam::channel::{Sender, select};
 use regex::Regex;
 
 use crate::app::AppMessage;
@@ -11,16 +11,20 @@ struct JobWatcher {
     app: Sender<AppMessage>,
     interval: Duration,
     squeue_args: Vec<String>,
+    args_receiver: crossbeam::channel::Receiver<Vec<String>>,
 }
 
-pub struct JobWatcherHandle {}
+pub struct JobWatcherHandle {
+    sender: crossbeam::channel::Sender<Vec<String>>,
+}
 
 impl JobWatcher {
-    fn new(app: Sender<AppMessage>, interval: Duration, squeue_args: Vec<String>) -> Self {
+    fn new(app: Sender<AppMessage>, interval: Duration, squeue_args: Vec<String>, args_receiver: crossbeam::channel::Receiver<Vec<String>>) -> Self {
         Self {
             app,
             interval,
             squeue_args,
+            args_receiver,
         }
     }
 
@@ -50,6 +54,16 @@ impl JobWatcher {
             .join(",");
 
         loop {
+            // Check for args updates
+            select! {
+                recv(self.args_receiver) -> new_args => {
+                    if let Ok(new_args) = new_args {
+                        self.squeue_args = new_args;
+                    }
+                },
+                default => {}
+            }
+
             let jobs: Vec<Job> = Command::new("squeue")
                 .args(&self.squeue_args)
                 .arg("--array")
@@ -202,9 +216,14 @@ impl JobWatcher {
 
 impl JobWatcherHandle {
     pub fn new(app: Sender<AppMessage>, interval: Duration, squeue_args: Vec<String>) -> Self {
-        let mut actor = JobWatcher::new(app, interval, squeue_args);
+        let (args_sender, args_receiver) = crossbeam::channel::unbounded();
+        let mut actor = JobWatcher::new(app, interval, squeue_args, args_receiver);
         thread::spawn(move || actor.run());
 
-        Self {}
+        Self { sender: args_sender }
+    }
+
+    pub fn update_squeue_args(&self, new_args: Vec<String>) {
+        let _ = self.sender.send(new_args);
     }
 }

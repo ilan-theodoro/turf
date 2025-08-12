@@ -74,6 +74,10 @@ pub struct App {
     is_dragging_resize: bool,
     resize_area: Rect,
     terminal_width: u16,
+    column_widths: [u16; 6], // ST, Job ID, Partition, User, Time, Name
+    is_dragging_column: bool,
+    column_being_resized: Option<usize>,
+    column_resize_areas: Vec<Rect>,
 }
 
 pub struct Job {
@@ -195,6 +199,10 @@ impl App {
             is_dragging_resize: false,
             resize_area: Rect::default(),
             terminal_width: 100,
+            column_widths: [3, 12, 10, 10, 8, 20], // Default column widths
+            is_dragging_column: false,
+            column_being_resized: None,
+            column_resize_areas: Vec::new(),
         }
     }
 }
@@ -493,14 +501,15 @@ impl App {
             ViewMode::ArrayJobDetails(array_id) => format!("Array Job {} Tasks ({})", array_id, self.display_jobs.len()),
         };
 
-        let job_table = Table::new(rows, [
-            Constraint::Length(3),  // State compact
-            Constraint::Min(8),     // Job ID
-            Constraint::Min(8),     // Partition
-            Constraint::Min(8),     // User
-            Constraint::Min(8),     // Time
-            Constraint::Min(20),    // Name
-        ])
+        let constraints = [
+            Constraint::Length(self.column_widths[0]),  // State compact
+            Constraint::Length(self.column_widths[1]),  // Job ID
+            Constraint::Length(self.column_widths[2]),  // Partition
+            Constraint::Length(self.column_widths[3]),  // User
+            Constraint::Length(self.column_widths[4]),  // Time
+            Constraint::Min(self.column_widths[5]),     // Name (expandable)
+        ];
+        let job_table = Table::new(rows, constraints)
             .header(Row::new(vec!["ST", "Job ID", "Partition", "User", "Time", "Name"])
                 .style(Style::default().add_modifier(Modifier::BOLD)))
             .block(
@@ -523,6 +532,9 @@ impl App {
         self.job_list_scrollbar_area = job_area_with_scrollbar[0];
         self.job_list_area = job_area_with_scrollbar[1];
         
+        // Calculate column resize areas
+        self.calculate_column_resize_areas(job_area_with_scrollbar[1]);
+        
         // Create resize area (2 pixels wide at the border between panels)
         self.resize_area = Rect::new(
             master_detail[0].right().saturating_sub(1),
@@ -539,6 +551,17 @@ impl App {
             1,
             master_detail[0].height,
         ));
+        
+        // Render column resize indicators
+        for area in &self.column_resize_areas {
+            let column_handle = Block::default();
+            f.render_widget(column_handle, Rect::new(
+                area.x,
+                area.y,
+                1,
+                area.height,
+            ));
+        }
         
         // Render the scrollbar
         let scrollbar = Scrollbar::default()
@@ -871,12 +894,17 @@ impl App {
                     self.handle_scrollbar_click(mouse.row);
                 } else if self.is_mouse_in_resize_area(mouse.column, mouse.row) {
                     self.is_dragging_resize = true;
+                } else if let Some(column_idx) = self.is_mouse_in_column_resize_area(mouse.column, mouse.row) {
+                    self.is_dragging_column = true;
+                    self.column_being_resized = Some(column_idx);
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 // End drag
                 self.is_dragging_scrollbar = false;
                 self.is_dragging_resize = false;
+                self.is_dragging_column = false;
+                self.column_being_resized = None;
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 // Handle dragging
@@ -884,6 +912,8 @@ impl App {
                     self.handle_scrollbar_drag(mouse.row);
                 } else if self.is_dragging_resize {
                     self.handle_resize_drag(mouse.column);
+                } else if self.is_dragging_column {
+                    self.handle_column_resize_drag(mouse.column);
                 }
             }
             _ => {}
@@ -914,6 +944,35 @@ impl App {
         row >= area.y && row < area.y + area.height
     }
 
+    fn calculate_column_resize_areas(&mut self, table_area: Rect) {
+        self.column_resize_areas.clear();
+        let mut x = table_area.x + 1; // Start after left border
+        
+        // Calculate position after each column (except the last one)
+        for i in 0..5 { // Only first 5 columns are resizable (last column expands)
+            x += self.column_widths[i] + 1; // +1 for column spacing
+            
+            // Create resize area (2 pixels wide at column boundary)
+            let resize_area = Rect::new(
+                x.saturating_sub(1),
+                table_area.y + 1, // Skip header
+                2,
+                table_area.height.saturating_sub(2), // Skip header and bottom border
+            );
+            self.column_resize_areas.push(resize_area);
+        }
+    }
+
+    fn is_mouse_in_column_resize_area(&self, column: u16, row: u16) -> Option<usize> {
+        for (i, area) in self.column_resize_areas.iter().enumerate() {
+            if column >= area.x && column < area.x + area.width &&
+               row >= area.y && row < area.y + area.height {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     fn handle_scrollbar_click(&mut self, row: u16) {
         self.handle_scrollbar_position_change(row);
     }
@@ -930,6 +989,26 @@ impl App {
         
         let new_ratio = ((column as f32 / self.terminal_width as f32) * 100.0) as u16;
         self.split_ratio = new_ratio.max(min_left).min(max_left);
+    }
+
+    fn handle_column_resize_drag(&mut self, mouse_column: u16) {
+        if let Some(column_idx) = self.column_being_resized {
+            // Calculate the starting position of this column
+            let table_start = self.job_list_area.x + 1; // +1 for left border
+            let mut column_start = table_start;
+            
+            for i in 0..column_idx {
+                column_start += self.column_widths[i] + 1; // +1 for spacing
+            }
+            
+            // Calculate new width based on mouse position
+            let new_width = mouse_column.saturating_sub(column_start);
+            let min_width = 3; // Minimum column width
+            let max_width = 50; // Maximum column width
+            
+            // Update the column width with constraints
+            self.column_widths[column_idx] = new_width.max(min_width).min(max_width);
+        }
     }
 
     fn handle_scrollbar_position_change(&mut self, row: u16) {

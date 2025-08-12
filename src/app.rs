@@ -15,7 +15,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap},
     Frame, Terminal,
 };
 use std::io;
@@ -478,21 +478,28 @@ impl App {
                 } else {
                     j.id()
                 };
-                let row = Row::new(vec![
-                    j.state_compact.clone(),
-                    id_display,
-                    j.partition.clone(),
-                    j.user.clone(),
-                    j.time.clone(),
-                    j.name.clone(),
-                ]);
                 
-                // Apply different style for collapsed array jobs
-                if j.is_array {
-                    row.style(Style::default().fg(Color::Cyan))
-                } else {
-                    row
-                }
+                // Create colored cells for each column
+                let cells = vec![
+                    // ST - white
+                    Cell::from(Span::styled(format!("{}", &j.state_compact), Style::default().fg(Color::White))),
+                    // Job ID - yellow (or cyan for array jobs)
+                    Cell::from(Span::styled(format!("{}", id_display), if j.is_array {
+                        Style::default().fg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    })),
+                    // Partition - blue
+                    Cell::from(Span::styled(format!("{}", &j.partition), Style::default().fg(Color::Blue))),
+                    // User - green
+                    Cell::from(Span::styled(format!("{}", &j.user), Style::default().fg(Color::Green))),
+                    // Time - red
+                    Cell::from(Span::styled(format!("{}", &j.time), Style::default().fg(Color::Red))),
+                    // Name - white
+                    Cell::from(Span::styled(format!("{}", &j.name), Style::default().fg(Color::White))),
+                ];
+                
+                Row::new(cells)
             })
             .collect();
 
@@ -509,9 +516,38 @@ impl App {
             Constraint::Length(self.column_widths[4]),  // Time
             Constraint::Min(self.column_widths[5]),     // Name (expandable)
         ];
+        // Create header with bordered appearance using box drawing characters
+        let header_style = Style::default().add_modifier(Modifier::BOLD);
+        // let separator_style = Style::default().add_modifier(Modifier::DIM);
+        let header_cells = vec![
+            Cell::from(Line::from(vec![
+                // Span::styled("│", separator_style),
+                Span::styled("st", header_style),
+            ])),
+            Cell::from(Line::from(vec![
+                //Span::styled("│", separator_style),
+                Span::styled("job id", header_style),
+            ])),
+            Cell::from(Line::from(vec![
+                //Span::styled("│", separator_style),
+                Span::styled("partition", header_style),
+            ])),
+            Cell::from(Line::from(vec![
+                //Span::styled("│", separator_style),
+                Span::styled("user", header_style),
+            ])),
+            Cell::from(Line::from(vec![
+                //Span::styled("│", separator_style),
+                Span::styled("time", header_style),
+            ])),
+            Cell::from(Line::from(vec![
+                //Span::styled("│", separator_style),
+                Span::styled("name", header_style),
+            ])),
+        ];
+        
         let job_table = Table::new(rows, constraints)
-            .header(Row::new(vec!["ST", "Job ID", "Partition", "User", "Time", "Name"])
-                .style(Style::default().add_modifier(Modifier::BOLD)))
+            .header(Row::new(header_cells))
             .block(
                 Block::default()
                     .title(title)
@@ -956,7 +992,7 @@ impl App {
             let resize_area = Rect::new(
                 x.saturating_sub(1),
                 table_area.y + 1, // Skip header
-                2,
+                self.column_widths[i+1].saturating_sub(1),
                 table_area.height.saturating_sub(2), // Skip header and bottom border
             );
             self.column_resize_areas.push(resize_area);
@@ -1155,7 +1191,7 @@ impl App {
                 self.jobs.iter()
                     .filter(|job| job.array_id == *array_id && job.array_step.is_some())
                     .map(|job| DisplayJob {
-                        job_id: job.job_id.clone(),
+                        job_id: job.id(), // Use the id() method which formats array_id_step properly
                         array_id: job.array_id.clone(),
                         name: job.name.clone(),
                         state: job.state.clone(),

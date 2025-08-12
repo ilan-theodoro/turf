@@ -5,6 +5,7 @@ use crossbeam::{
 use itertools::Either;
 use std::{cmp::min, iter::once, path::PathBuf, process::Command};
 use std::{process::Stdio, time::Duration};
+use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 
 use crate::file_watcher::{FileWatcherError, FileWatcherHandle};
 use crate::job_watcher::JobWatcherHandle;
@@ -12,7 +13,7 @@ use crate::job_watcher::JobWatcherHandle;
 use crossterm::event::{Event, KeyCode, KeyEvent, MouseEvent, MouseEventKind, MouseButton};
 use ratatui::{
     backend::Backend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap},
@@ -20,8 +21,10 @@ use ratatui::{
 };
 use std::io;
 
+#[derive(PartialEq)]
 pub enum Focus {
     Jobs,
+    FuzzyFinder,
 }
 
 #[derive(Clone)]
@@ -78,6 +81,11 @@ pub struct App {
     is_dragging_column: bool,
     column_being_resized: Option<usize>,
     column_resize_areas: Vec<Rect>,
+    // Fuzzy finder state
+    fuzzy_finder_active: bool,
+    fuzzy_finder_input: String,
+    fuzzy_finder_filtered_jobs: Vec<(usize, i64)>, // (original_index, score)
+    fuzzy_finder_selected: usize,
 }
 
 pub struct Job {
@@ -203,6 +211,11 @@ impl App {
             is_dragging_column: false,
             column_being_resized: None,
             column_resize_areas: Vec::new(),
+            // Fuzzy finder initialization
+            fuzzy_finder_active: false,
+            fuzzy_finder_input: String::new(),
+            fuzzy_finder_filtered_jobs: Vec::new(),
+            fuzzy_finder_selected: 0,
         }
     }
 }
@@ -302,16 +315,27 @@ impl App {
                             _ => {}
                         },
                     };
-                } else {
+                } else if self.fuzzy_finder_active {
+                    // Handle fuzzy finder input only
                     match key.code {
+                        KeyCode::Up => self.fuzzy_finder_previous(),
+                        KeyCode::Down => self.fuzzy_finder_next(),
+                        KeyCode::Enter => self.fuzzy_finder_select(),
+                        KeyCode::Esc => self.deactivate_fuzzy_finder(),
+                        KeyCode::Backspace => self.fuzzy_finder_backspace(),
+                        KeyCode::Char(c) => self.fuzzy_finder_input(c),
+                        _ => {}
+                    }
+                } else {
+                    // Handle normal application input only
+                    match key.code {
+                        KeyCode::Char('/') => {
+                            self.activate_fuzzy_finder();
+                        },
                         KeyCode::Char('h') | KeyCode::Left => self.focus_previous_panel(),
                         KeyCode::Char('l') | KeyCode::Right => self.focus_next_panel(),
-                        KeyCode::Char('k') | KeyCode::Up => match self.focus {
-                            Focus::Jobs => self.select_previous_job(),
-                        },
-                        KeyCode::Char('j') | KeyCode::Down => match self.focus {
-                            Focus::Jobs => self.select_next_job(),
-                        },
+                        KeyCode::Char('k') | KeyCode::Up => self.select_previous_job(),
+                        KeyCode::Char('j') | KeyCode::Down => self.select_next_job(),
                         KeyCode::PageDown => {
                             let delta = if key.modifiers.intersects(
                                 crossterm::event::KeyModifiers::SHIFT
@@ -379,14 +403,12 @@ impl App {
                         KeyCode::Char('w') => {
                             self.job_output_wrap = !self.job_output_wrap;
                         }
-                        KeyCode::Enter => {
-                            self.enter_array_job();
-                        }
+                        KeyCode::Enter => self.enter_array_job(),
                         KeyCode::Esc => {
                             if matches!(self.view_mode, ViewMode::ArrayJobDetails(_)) {
                                 self.exit_array_job();
                             }
-                        }
+                        },
                         _ => {}
                     };
                 }
@@ -431,23 +453,34 @@ impl App {
             .split(master_detail[1]);
 
         // Help
-        let help_options = match &self.view_mode {
-            ViewMode::AllJobs => vec![
-                ("q", "quit"),
+        let help_options = if self.fuzzy_finder_active {
+            vec![
+                ("type", "search"),
                 ("⏶/⏷", "navigate"),
-                ("enter", "expand array"),
-                ("c", "cancel job"),
-                ("o", "toggle stdout/stderr"),
-                ("w", "toggle text wrap"),
-            ],
-            ViewMode::ArrayJobDetails(_) => vec![
-                ("q", "quit"),
-                ("⏶/⏷", "navigate"),
-                ("esc", "back to jobs"),
-                ("c", "cancel job"),
-                ("o", "toggle stdout/stderr"),
-                ("w", "toggle text wrap"),
-            ],
+                ("enter", "select"),
+                ("esc", "cancel"),
+            ]
+        } else {
+            match &self.view_mode {
+                ViewMode::AllJobs => vec![
+                    ("q", "quit"),
+                    ("/", "fuzzy find"),
+                    ("⏶/⏷", "navigate"),
+                    ("enter", "expand array"),
+                    ("c", "cancel job"),
+                    ("o", "toggle stdout/stderr"),
+                    ("w", "toggle text wrap"),
+                ],
+                ViewMode::ArrayJobDetails(_) => vec![
+                    ("q", "quit"),
+                    ("/", "fuzzy find"),
+                    ("⏶/⏷", "navigate"),
+                    ("esc", "back to jobs"),
+                    ("c", "cancel job"),
+                    ("o", "toggle stdout/stderr"),
+                    ("w", "toggle text wrap"),
+                ],
+            }
         };
         let blue_style = Style::default().fg(Color::Blue);
         let light_blue_style = Style::default().fg(Color::LightBlue);
@@ -557,6 +590,7 @@ impl App {
                     } else {
                         match self.focus {
                             Focus::Jobs => Style::default().fg(Color::Green),
+                            Focus::FuzzyFinder => Style::default().fg(Color::Yellow),
                         }
                     }),
             )
@@ -717,6 +751,11 @@ impl App {
         self.job_output_area = log_area;
         f.render_widget(log, log_area);
 
+        // Render fuzzy finder if active
+        if self.fuzzy_finder_active {
+            self.render_fuzzy_finder(f);
+        }
+
         if let Some(dialog) = &self.dialog {
             fn centered_lines(percent_x: u16, lines: u16, r: Rect) -> Rect {
                 let dy = r.height.saturating_sub(lines) / 2;
@@ -766,6 +805,199 @@ impl App {
                     f.render_widget(dialog, area);
                 }
             }
+        }
+    }
+
+    // Fuzzy finder methods
+    fn activate_fuzzy_finder(&mut self) {
+        self.fuzzy_finder_active = true;
+        self.focus = Focus::FuzzyFinder;
+        self.fuzzy_finder_input.clear();
+        self.fuzzy_finder_selected = 0;
+        self.update_fuzzy_finder();
+    }
+
+    fn deactivate_fuzzy_finder(&mut self) {
+        self.fuzzy_finder_active = false;
+        self.focus = Focus::Jobs;
+        self.fuzzy_finder_input.clear();
+        self.fuzzy_finder_filtered_jobs.clear();
+    }
+
+    fn fuzzy_finder_input(&mut self, c: char) {
+        self.fuzzy_finder_input.push(c);
+        self.fuzzy_finder_selected = 0;
+        self.update_fuzzy_finder();
+    }
+
+    fn fuzzy_finder_backspace(&mut self) {
+        self.fuzzy_finder_input.pop();
+        self.fuzzy_finder_selected = 0;
+        self.update_fuzzy_finder();
+    }
+
+    fn fuzzy_finder_next(&mut self) {
+        if !self.fuzzy_finder_filtered_jobs.is_empty() {
+            self.fuzzy_finder_selected = (self.fuzzy_finder_selected + 1).min(self.fuzzy_finder_filtered_jobs.len() - 1);
+        }
+    }
+
+    fn fuzzy_finder_previous(&mut self) {
+        if self.fuzzy_finder_selected > 0 {
+            self.fuzzy_finder_selected -= 1;
+        }
+    }
+
+    fn fuzzy_finder_select(&mut self) {
+        if let Some(&(original_index, _)) = self.fuzzy_finder_filtered_jobs.get(self.fuzzy_finder_selected) {
+            self.job_list_state.select(Some(original_index));
+            self.update_job_list_scrollbar();
+            self.deactivate_fuzzy_finder();
+        }
+    }
+
+    fn update_fuzzy_finder(&mut self) {
+        let matcher = SkimMatcherV2::default();
+        
+        if self.fuzzy_finder_input.is_empty() {
+            self.fuzzy_finder_filtered_jobs = self.display_jobs
+                .iter()
+                .enumerate()
+                .map(|(i, _)| (i, 0))
+                .collect();
+        } else {
+            let mut scored_jobs = Vec::new();
+            
+            for (i, job) in self.display_jobs.iter().enumerate() {
+                // Search in multiple fields: job_id, name, user, partition, state
+                let searchable_text = format!("{} {} {} {} {}", 
+                    job.id(), job.name, job.user, job.partition, job.state);
+                
+                if let Some(score) = matcher.fuzzy_match(&searchable_text, &self.fuzzy_finder_input) {
+                    scored_jobs.push((i, score));
+                }
+            }
+            
+            // Sort by score (higher is better)
+            scored_jobs.sort_by(|a, b| b.1.cmp(&a.1));
+            self.fuzzy_finder_filtered_jobs = scored_jobs;
+        }
+        
+        // Ensure selected index is valid
+        if self.fuzzy_finder_selected >= self.fuzzy_finder_filtered_jobs.len() {
+            self.fuzzy_finder_selected = 0;
+        }
+    }
+
+    fn render_fuzzy_finder(&self, f: &mut Frame) {
+        // Create an overlay in the center of the screen
+        let area = f.area();
+        let finder_width = (area.width * 3 / 4).max(60).min(area.width.saturating_sub(4));
+        let finder_height = 12.min(area.height.saturating_sub(4));
+        
+        let finder_area = Rect::new(
+            (area.width.saturating_sub(finder_width)) / 2,
+            (area.height.saturating_sub(finder_height)) / 2,
+            finder_width,
+            finder_height,
+        );
+
+        // Clear the background
+        f.render_widget(Clear, finder_area);
+
+        // Split into input and results areas
+        let vertical_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Input area with border
+                Constraint::Min(0),    // Results area
+            ])
+            .split(finder_area);
+
+        // Input field
+        let input_text = format!("{}", self.fuzzy_finder_input);
+        let input_paragraph = Paragraph::new(input_text)
+            .style(Style::default().fg(Color::Yellow))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Fuzzy Find")
+                    .border_style(Style::default().fg(Color::Yellow))
+            );
+        f.render_widget(input_paragraph, vertical_layout[0]);
+
+        // Results list
+        if !self.fuzzy_finder_filtered_jobs.is_empty() {
+            let visible_height = vertical_layout[1].height.saturating_sub(2) as usize; // -2 for borders
+            
+            // Calculate scroll offset to keep selected item visible
+            let scroll_offset = if self.fuzzy_finder_selected < visible_height {
+                0
+            } else {
+                self.fuzzy_finder_selected.saturating_sub(visible_height - 1)
+            };
+            
+            let results: Vec<Row> = self.fuzzy_finder_filtered_jobs
+                .iter()
+                .skip(scroll_offset)
+                .take(visible_height)
+                .enumerate()
+                .map(|(display_i, &(original_index, _))| {
+                    let actual_i = display_i + scroll_offset;
+                    let job = &self.display_jobs[original_index];
+                    let id_display = if job.is_array && job.task_count.is_some() {
+                        format!("{} [{}]", job.array_id, job.task_count.unwrap())
+                    } else {
+                        job.id()
+                    };
+                    
+                    let style = if actual_i == self.fuzzy_finder_selected {
+                        Style::default().bg(Color::Blue).fg(Color::White)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    
+                    Row::new(vec![
+                        Cell::from(Span::styled(&job.state_compact, style)),
+                        Cell::from(Span::styled(id_display, style)),
+                        Cell::from(Span::styled(&job.user, style)),
+                        Cell::from(Span::styled(&job.name, style)),
+                    ])
+                })
+                .collect();
+
+            let results_table = Table::new(
+                results,
+                [
+                    Constraint::Length(3),  // State
+                    Constraint::Length(15), // Job ID
+                    Constraint::Length(10), // User
+                    Constraint::Min(0),     // Name
+                ],
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("Results ({}/{})", 
+                        self.fuzzy_finder_selected + 1, 
+                        self.fuzzy_finder_filtered_jobs.len()))
+                    .border_style(Style::default().fg(Color::Green))
+            )
+            .column_spacing(1);
+
+            f.render_widget(results_table, vertical_layout[1]);
+        } else {
+            // Show "No results" message
+            let no_results = Paragraph::new("No results found")
+                .style(Style::default().fg(Color::Red))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Results")
+                        .border_style(Style::default().fg(Color::Red))
+                )
+                .alignment(Alignment::Center);
+            f.render_widget(no_results, vertical_layout[1]);
         }
     }
 }
@@ -1073,12 +1305,14 @@ impl App {
     fn focus_next_panel(&mut self) {
         match self.focus {
             Focus::Jobs => self.focus = Focus::Jobs,
+            Focus::FuzzyFinder => {},
         }
     }
 
     fn focus_previous_panel(&mut self) {
         match self.focus {
             Focus::Jobs => self.focus = Focus::Jobs,
+            Focus::FuzzyFinder => {},
         }
     }
 
